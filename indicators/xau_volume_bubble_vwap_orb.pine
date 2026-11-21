@@ -1,243 +1,90 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-//  XAU Volume Orbs + VWAP  (v2 – clean "orb" design)
+//  XAU Volume Bubble + VWAP  (v3)
 //
-//  • Volume Orbs : only the N highest-volume CLOSED candles in a recent window
-//                  (minimum spacing between them). Each orb = glowing dot above
-//                  the candle + volume call-out pill below it + a level line at
-//                  the candle's volume-weighted price, extended to the right.
-//                  Solid line = level not retested yet, dotted = retested.
-//  • VWAP        : anchored (Session / Week / Month) with thin ±σ band lines.
-//  • Opening Range (optional, off by default): high / low / mid, 1R / 2R
-//                  targets, breakout and failed-breakout markers.
+//  • A bubble is drawn on every closed bar whose volume is unusually high
+//    (≥ N × its recent average). The bubble sits ON THAT BAR'S VWAP PRICE
+//    (volume-weighted price inside the bar, from lower-timeframe data; HLC3
+//    when no intrabar data exists). Bubble size = how big the volume is.
+//    The real volume number is printed inside the bubble.
+//  • Bubble colour = candle direction (green up, red down). No buy/sell
+//    estimation is used.
+//  • Session / Week / Month VWAP line with optional ±σ band lines.
 //
-//  IMPORTANT
-//  • On XAUUSD CFD feeds, volume = broker TICK COUNT (activity), not traded size.
-//  • Buy/sell delta is an ESTIMATE from lower-timeframe candle direction
-//    (close vs open + tick rule). Not exchange aggressor data.
-//  • Defaults are proposals, not backtested. Signals use closed bars only.
+//  Note: on XAUUSD CFD feeds the broker's "volume" is a tick count. This
+//  script shows that number as-is; it does not estimate anything from it.
 // ─────────────────────────────────────────────────────────────────────────────
-indicator("XAU Volume Orbs + VWAP", shorttitle = "Vol Orbs", overlay = true,
-     max_labels_count = 300, max_lines_count = 300, max_boxes_count = 50, max_bars_back = 500)
+indicator("XAU Volume Bubble + VWAP", shorttitle = "VolBubble·VWAP", overlay = true, max_labels_count = 500)
 
 // ═════════════════════════════ INPUTS ═══════════════════════════════════════
-const string G_ORB = "Volume Orbs"
-const string G_DAT = "Volume data"
-const string G_VW  = "VWAP"
-const string G_OR  = "Opening Range (optional)"
-const string G_UI  = "Colours & Dashboard"
+const string G_B  = "Volume Bubble"
+const string G_VW = "VWAP"
+const string G_C  = "Colours"
 
-bool   showOrbs  = input.bool(true, "Show volume orbs", group = G_ORB)
-int    orbWin    = input.int(100, "Look-back window (bars)", minval = 20, maxval = 300, group = G_ORB,
-     tooltip = "Orbs are picked only from the most recent closed bars in this window.")
-int    orbCount  = input.int(5, "Number of orbs", minval = 1, maxval = 12, group = G_ORB)
-int    orbGap    = input.int(5, "Minimum bars between orbs", minval = 1, maxval = 50, group = G_ORB)
-string colorBy   = input.string("Estimated delta", "Orb colour", options = ["Estimated delta", "Candle direction"], group = G_ORB)
-bool   markAbs   = input.bool(true, "Yellow orb for absorption", group = G_ORB,
-     tooltip = "High-volume candle whose body is smaller than the value below × ATR(14): big effort, little result.")
-float  absBody   = input.float(0.3, "Absorption: max body (× ATR)", minval = 0.05, step = 0.05, group = G_ORB)
-string callMode  = input.string("All orbs", "Volume text", options = ["All orbs", "Top 3", "Top 1", "Off"], group = G_ORB)
-bool   showDTxt  = input.bool(true, "Add Δ% to volume text", group = G_ORB)
-bool   showLvl   = input.bool(true, "Orb level lines", group = G_ORB)
-string lvlSrc    = input.string("Intrabar VWAP", "Level price", options = ["Intrabar VWAP", "Close", "HL2"], group = G_ORB,
-     tooltip = "Intrabar VWAP = the volume-weighted price inside that candle (where most of its volume traded).")
-
-string ltfMode   = input.string("Auto", "Intrabar timeframe", options = ["Auto", "1", "5", "15", "60"], group = G_DAT,
-     tooltip = "Auto: chart ≤15m → 1m, ≤4h → 5m, otherwise 60m. If the intrabar timeframe is not lower than the chart (e.g. a 1m chart), the bar-shape estimate is used instead.")
-int    relLen    = input.int(20, "Relative volume length", minval = 5, group = G_DAT)
-float  alertRel  = input.float(2.0, "Alert: relative volume ≥", minval = 1.0, step = 0.1, group = G_DAT)
+bool   showBub  = input.bool(true, "Show bubbles", group = G_B)
+int    avgLen   = input.int(20, "Average volume length", minval = 5, group = G_B)
+float  minMult  = input.float(2.0, "Bubble when volume ≥ × average", minval = 1.0, step = 0.1, group = G_B,
+     tooltip = "Small bubble from this multiple, medium from +1, large from +2. Raise it to see fewer bubbles.")
+bool   showTxt  = input.bool(true, "Volume number inside bubble", group = G_B)
+string ltfMode  = input.string("Auto", "Intrabar timeframe (bubble price)", options = ["Auto", "1", "5", "15", "60"], group = G_B,
+     tooltip = "Used only to find each bar's own VWAP price. Auto: chart ≤15m → 1m, ≤4h → 5m, otherwise 60m. When it is not lower than the chart timeframe, HLC3 is used.")
+int    maxBars  = input.int(500, "Draw bubbles on the last N bars", minval = 50, maxval = 5000, group = G_B)
 
 bool   showVwap  = input.bool(true, "Show VWAP", group = G_VW)
 string vwAnchor  = input.string("Session", "Anchor", options = ["Session", "Week", "Month"], group = G_VW)
-bool   showBands = input.bool(true, "Show band lines", group = G_VW)
+bool   showBands = input.bool(false, "Show ±σ band lines", group = G_VW)
 float  band1     = input.float(1.0, "Band 1 (σ)", minval = 0.1, step = 0.1, group = G_VW)
 float  band2     = input.float(2.0, "Band 2 (σ)", minval = 0.1, step = 0.1, group = G_VW)
-bool   bandFill  = input.bool(false, "Faint band fill", group = G_VW)
 
-bool   showOR    = input.bool(false, "Show opening range", group = G_OR)
-string orbPreset = input.string("New York 09:30 ET", "Opening session",
-     options = ["New York 09:30 ET", "COMEX 08:20 ET", "London 08:00 UK", "Asia 09:00 Tokyo", "Custom"], group = G_OR)
-int    orbLen    = input.int(30, "Range length (minutes)", options = [5, 15, 30, 60, 120, 240], group = G_OR)
-int    custH     = input.int(9, "Custom start hour", minval = 0, maxval = 23, inline = "cust", group = G_OR)
-int    custM     = input.int(30, "min", minval = 0, maxval = 59, inline = "cust", group = G_OR)
-string custTz    = input.string("America/New_York", "Custom timezone", group = G_OR)
-int    holdHrs   = input.int(8, "Extend lines (hours after range)", minval = 1, maxval = 24, group = G_OR)
-bool   showExt   = input.bool(true, "Show 1R / 2R targets", group = G_OR)
-bool   showBrk   = input.bool(true, "Show breakout markers", group = G_OR)
-int    failBars  = input.int(3, "Failed breakout window (bars)", minval = 1, maxval = 20, group = G_OR)
-
-color  cBuy      = input.color(#00E676, "Buy", inline = "c1", group = G_UI)
-color  cSell     = input.color(#FF1744, "Sell", inline = "c1", group = G_UI)
-color  cAbs      = input.color(#FFC400, "Absorption", inline = "c1", group = G_UI)
-color  cVwap     = input.color(#B388FF, "VWAP", inline = "c2", group = G_UI)
-color  cOrH      = input.color(#29B6F6, "OR High", inline = "c3", group = G_UI)
-color  cOrL      = input.color(#FF8A65, "OR Low", inline = "c3", group = G_UI)
-bool   showDash  = input.bool(true, "Show dashboard", group = G_UI)
-string dashPosIn = input.string("Bottom right", "Dashboard position", options = ["Bottom right", "Top right", "Bottom left", "Top left"], group = G_UI)
+color  cUp   = input.color(#00E676, "Up bar bubble", group = G_C)
+color  cDn   = input.color(#FF1744, "Down bar bubble", group = G_C)
+color  cVwap = input.color(#B388FF, "VWAP", group = G_C)
 
 // ═════════════════════════════ HELPERS ══════════════════════════════════════
 color noCol = color.new(color.black, 100)
 
-// 1234 → 1.2K, 2500000 → 2.5M
 f_fmt(float v) =>
     float a = math.abs(v)
-    a >= 1e9 ? str.tostring(v / 1e9, "#.##") + "B" : a >= 1e6 ? str.tostring(v / 1e6, "#.##") + "M" : a >= 1e3 ? str.tostring(v / 1e3, "#.#") + "K" : str.tostring(v, "#")
+    a >= 1e9 ? str.tostring(v / 1e9, "#.#") + "B" : a >= 1e6 ? str.tostring(v / 1e6, "#.#") + "M" : a >= 1e3 ? str.tostring(v / 1e3, "#.#") + "K" : str.tostring(v, "#")
 
-// dark text on bright fills, white text on dark fills
-f_ink(color c) =>
-    color.r(c) * 0.299 + color.g(c) * 0.587 + color.b(c) * 0.114 > 140 ? #0B0E14 : color.white
-
-f_tfLabel(string tf) =>
-    float m = str.tonumber(tf)
-    na(m) ? tf : m >= 60 ? str.tostring(m / 60) + "h" : str.tostring(m) + "m"
-
-// ═════════════════════════════ INTRABAR DATA & DELTA ════════════════════════
+// ═════════════════════════════ BAR VWAP PRICE (bubble position) ════════════
 int    chartSec = timeframe.in_seconds()
 string autoLtf  = chartSec <= 900 ? "1" : chartSec <= 14400 ? "5" : "60"
 string ltf      = ltfMode == "Auto" ? autoLtf : ltfMode
 bool   ltfLower = timeframe.in_seconds(ltf) < chartSec
 
-[ibO, ibC, ibV, ibH, ibL, ibT] = request.security_lower_tf(syminfo.tickerid, ltf, [open, close, volume, high, low, time],
-     ignore_invalid_timeframe = true)
-int  ibN   = na(ibV) ? 0 : ibV.size()
-// one intrabar per candle (intrabar TF = chart TF) would always give ±100 %, so it is not used for delta
-bool useIb = ltfLower and ibN > 0
+[ibH, ibL, ibC, ibV] = request.security_lower_tf(syminfo.tickerid, ltf, [high, low, close, volume], ignore_invalid_timeframe = true)
+int ibN = na(ibV) ? 0 : ibV.size()
 
-var float lastSign = 1.0
-var float prevIbC  = na
-float buyV  = 0.0
-float sellV = 0.0
-float pvSum = 0.0
-float ibVol = 0.0
-if useIb
+float pv = 0.0
+float vv = 0.0
+if ltfLower and ibN > 0
     for i = 0 to ibN - 1
-        float o = ibO.get(i)
-        float c = ibC.get(i)
         float v = nz(ibV.get(i))
-        float s = c > o ? 1.0 : c < o ? -1.0 : na(prevIbC) ? lastSign : c > prevIbC ? 1.0 : c < prevIbC ? -1.0 : lastSign
-        lastSign := s
-        prevIbC  := c
-        if s > 0
-            buyV += v
-        else
-            sellV += v
-        pvSum += v * (ibH.get(i) + ibL.get(i) + c) / 3.0
-        ibVol += v
-else
-    // bar-shape split (volume × close location in the range): a rough estimate only
-    float rngFb = high - low
-    float vFb   = nz(volume)
-    float dFb   = rngFb > 0 ? vFb * (2 * close - high - low) / rngFb : 0.0
-    buyV  := (vFb + dFb) / 2
-    sellV := (vFb - dFb) / 2
+        pv += v * (ibH.get(i) + ibL.get(i) + ibC.get(i)) / 3.0
+        vv += v
+float barVwap = vv > 0 ? pv / vv : hlc3
 
-float totV     = buyV + sellV
-float delta    = buyV - sellV
-float deltaPct = totV > 0 ? 100 * delta / totV : 0.0
-float ibVwap   = ibVol > 0 ? pvSum / ibVol : hlc3
+// ═════════════════════════════ VOLUME BUBBLES ═══════════════════════════════
+float avgVol = ta.sma(volume, avgLen)[1]          // average of the previous bars
+float mult   = avgVol > 0 ? nz(volume) / avgVol : 0.0
+int   tier   = mult >= minMult + 2 ? 3 : mult >= minMult + 1 ? 2 : mult >= minMult ? 1 : 0
+bool  recent = bar_index >= last_bar_index - maxBars
 
-float atr      = ta.atr(14)
-float volBase  = ta.sma(volume, relLen)[1]
-float relVol   = volBase > 0 ? nz(volume) / volBase : na
-bool  absBar   = math.abs(close - open) <= absBody * atr
-float lvlPx    = lvlSrc == "Close" ? close : lvlSrc == "HL2" ? hl2 : ibVwap
-
-// ═════════════════════════════ VOLUME ORBS (redrawn on the last bar) ═══════
-var array<label> orbLb = array.new<label>()
-var array<line>  orbLn = array.new<line>()
-
-if barstate.islast
-    for l in orbLb
-        l.delete()
-    orbLb.clear()
-    for l in orbLn
-        l.delete()
-    orbLn.clear()
-
-if barstate.islast and showOrbs
-    // the live candle is left out until it closes, so orbs never jump around
-    int o0  = barstate.isconfirmed ? 0 : 1
-    int win = math.min(orbWin, bar_index + 1 - o0)
-    array<int> picks = array.new<int>()        // bar offsets, highest volume first
-    if win > 0
-        while picks.size() < orbCount
-            int   best  = -1
-            float bestV = 0.0
-            for o = o0 to o0 + win - 1
-                float v = nz(volume[o])
-                if v > bestV
-                    bool clash = false
-                    for p in picks
-                        if math.abs(p - o) < orbGap
-                            clash := true
-                            break
-                    if not clash
-                        bestV := v
-                        best  := o
-            if best < 0
-                break
-            picks.push(best)
-
-    float tierH = atr * 0.9                     // vertical spacing between call-outs
-    array<int>   coX = array.new<int>()
-    array<float> coY = array.new<float>()
-    int nP = picks.size()
-    if nP > 0
-        for r = 0 to nP - 1
-            int   o    = picks.get(r)
-            int   px   = bar_index - o
-            float aO   = nz(atr[o], atr)
-            float dP   = deltaPct[o]
-            bool  isAb = markAbs and absBar[o]
-            color base = isAb ? cAbs : colorBy == "Candle direction" ? (close[o] >= open[o] ? cBuy : cSell) : (delta[o] >= 0 ? cBuy : cSell)
-            string kind = isAb ? "Absorption (big volume, small body)" : delta[o] >= 0 ? "Buy-dominant (estimated)" : "Sell-dominant (estimated)"
-            string tip = "#" + str.tostring(r + 1) + " volume in last " + str.tostring(win) + " bars\n" + kind +
-                 "\nVolume: " + f_fmt(nz(volume[o])) + (na(relVol[o]) ? "" : "  (×" + str.tostring(relVol[o], "#.0") + " avg)") +
-                 "\nΔ% est.: " + str.tostring(dP, "+#;-#") + "%" +
-                 "\nLevel: " + str.tostring(lvlPx[o], format.mintick)
-
-            // ── orb: soft halo + solid core, above the candle
-            float yOrb = high[o] + aO * 0.45
-            orbLb.push(label.new(px, yOrb, "●", style = label.style_label_center, color = noCol,
-                 textcolor = color.new(base, 72), size = r == 0 ? size.huge : size.large))
-            orbLb.push(label.new(px, yOrb, "●", style = label.style_label_center, color = noCol,
-                 textcolor = base, size = r == 0 ? size.large : size.normal, tooltip = tip))
-
-            // ── level line at the candle's volume-weighted price, to the right edge
-            if showLvl
-                float lvl = lvlPx[o]
-                bool  retested = false
-                if o - 1 >= o0
-                    for k = o - 1 to o0
-                        if low[k] <= lvl and high[k] >= lvl
-                            retested := true
-                            break
-                orbLn.push(line.new(px, lvl, bar_index + 3, lvl, color = color.new(base, retested ? 65 : 20),
-                     style = retested ? line.style_dotted : line.style_solid, width = r == 0 ? 2 : 1))
-                orbLb.push(label.new(bar_index + 3, lvl, str.tostring(lvl, format.mintick), style = label.style_label_left,
-                     color = noCol, textcolor = color.new(base, retested ? 45 : 0), size = size.tiny))
-
-            // ── volume call-out pill under the candle, on a dashed stem
-            bool wantCall = callMode == "All orbs" or (callMode == "Top 3" and r < 3) or (callMode == "Top 1" and r == 0)
-            if wantCall
-                float yLab = low[o] - aO * 0.7
-                // keep pills from printing over each other: step down a tier when too close
-                if coX.size() > 0
-                    for pass = 1 to 3
-                        bool moved = false
-                        for j = 0 to coX.size() - 1
-                            if math.abs(px - coX.get(j)) <= 12 and math.abs(yLab - coY.get(j)) < tierH
-                                yLab  := coY.get(j) - tierH
-                                moved := true
-                        if not moved
-                            break
-                coX.push(px)
-                coY.push(yLab)
-                orbLn.push(line.new(px, low[o] - aO * 0.1, px, yLab, color = color.new(base, 55), style = line.style_dashed, width = 1))
-                string txt = f_fmt(nz(volume[o])) + " VOL" + (showDTxt ? "  Δ" + str.tostring(dP, "+#;-#") + "%" : "")
-                orbLb.push(label.new(px, yLab, txt, style = label.style_label_up, color = base, textcolor = f_ink(base),
-                     size = size.small, text_formatting = text.format_bold, tooltip = tip))
+if showBub and tier > 0 and barstate.isconfirmed and recent
+    color  c      = close >= open ? cUp : cDn
+    string bubSz  = tier == 3 ? size.huge : tier == 2 ? size.large : size.normal
+    string txtSz  = tier == 3 ? size.normal : tier == 2 ? size.small : size.tiny
+    string tip    = "Volume: " + str.tostring(volume, format.volume) + "  (×" + str.tostring(mult, "#.0") + " avg)" +
+         "\nBar VWAP: " + str.tostring(barVwap, format.mintick) + (vv > 0 ? "" : " (HLC3)")
+    // bubble
+    label.new(bar_index, barVwap, "●", style = label.style_label_center, color = noCol,
+         textcolor = color.new(c, tier == 3 ? 25 : tier == 2 ? 35 : 45), size = bubSz, tooltip = tip)
+    // real volume number in the centre
+    if showTxt
+        label.new(bar_index, barVwap, f_fmt(nz(volume)), style = label.style_label_center, color = noCol,
+             textcolor = color.white, size = txtSz, text_formatting = text.format_bold, tooltip = tip)
 
 // ═════════════════════════════ VWAP ═════════════════════════════════════════
 bool chD = timeframe.change("D")
@@ -252,225 +99,26 @@ if newAnchor
     sPV  := 0.0
     sV   := 0.0
     sPV2 := 0.0
-float vSrc = hlc3
-float vVol = nz(volume)
-sPV  += vSrc * vVol
-sV   += vVol
-sPV2 += vSrc * vSrc * vVol
+sPV  += hlc3 * nz(volume)
+sV   += nz(volume)
+sPV2 += hlc3 * hlc3 * nz(volume)
 int   anchorSec = vwAnchor == "Session" ? 86400 : vwAnchor == "Week" ? 604800 : 2419200
 bool  vwapOk  = chartSec < anchorSec
 float vwapVal = vwapOk and sV > 0 ? sPV / sV : na
 float vwapSd  = vwapOk and sV > 0 ? math.sqrt(math.max(sPV2 / sV - vwapVal * vwapVal, 0.0)) : na
 
 bool bandsOn = showVwap and showBands
-pVw = plot(showVwap ? vwapVal : na, "VWAP", color = newAnchor ? na : cVwap, linewidth = 2)
-pU1 = plot(bandsOn ? vwapVal + band1 * vwapSd : na, "VWAP +1σ", color = newAnchor ? na : color.new(cVwap, 65))
-pU2 = plot(bandsOn ? vwapVal + band2 * vwapSd : na, "VWAP +2σ", color = newAnchor ? na : color.new(cVwap, 80))
-pL1 = plot(bandsOn ? vwapVal - band1 * vwapSd : na, "VWAP −1σ", color = newAnchor ? na : color.new(cVwap, 65))
-pL2 = plot(bandsOn ? vwapVal - band2 * vwapSd : na, "VWAP −2σ", color = newAnchor ? na : color.new(cVwap, 80))
-fill(pU1, pU2, color = bandFill and not newAnchor ? color.new(cVwap, 94) : na, title = "Upper band fill")
-fill(pL1, pL2, color = bandFill and not newAnchor ? color.new(cVwap, 94) : na, title = "Lower band fill")
+plot(showVwap ? vwapVal : na, "VWAP", color = newAnchor ? na : cVwap, linewidth = 2)
+plot(bandsOn ? vwapVal + band1 * vwapSd : na, "VWAP +1σ", color = newAnchor ? na : color.new(cVwap, 60))
+plot(bandsOn ? vwapVal - band1 * vwapSd : na, "VWAP −1σ", color = newAnchor ? na : color.new(cVwap, 60))
+plot(bandsOn ? vwapVal + band2 * vwapSd : na, "VWAP +2σ", color = newAnchor ? na : color.new(cVwap, 78))
+plot(bandsOn ? vwapVal - band2 * vwapSd : na, "VWAP −2σ", color = newAnchor ? na : color.new(cVwap, 78))
 
-// ═════════════════════════════ OPENING RANGE (optional) ════════════════════
-int orStartMin = switch orbPreset
-    "New York 09:30 ET" => 570
-    "COMEX 08:20 ET"    => 500
-    "London 08:00 UK"   => 480
-    "Asia 09:00 Tokyo"  => 540
-    => custH * 60 + custM
-string orTz = switch orbPreset
-    "New York 09:30 ET" => "America/New_York"
-    "COMEX 08:20 ET"    => "America/New_York"
-    "London 08:00 UK"   => "Europe/London"
-    "Asia 09:00 Tokyo"  => "Asia/Tokyo"
-    => custTz
+// ═════════════════════════════ DATA WINDOW & ALERTS ═════════════════════════
+plot(mult, "Volume × average", display = display.data_window)
+plot(barVwap, "Bar VWAP", display = display.data_window)
 
-var float orH        = na
-var float orL        = na
-var int   orDay      = na
-var int   orEndTs    = na
-var bool  orBuilding = false
-var bool  orDone     = false
-var bool  orApprox   = false
-bool newOr    = false
-bool justDone = false
-
-// A unit (intrabar, or the chart bar when there are no intrabars) is used when it
-// OVERLAPS the window; windows may cross midnight; sticking-out units mark the range "≈".
-bool chartOk = chartSec <= orbLen * 60
-int  nUnits  = not showOR ? 0 : ibN > 0 ? ibN : chartOk ? 1 : 0
-int  uLen    = ibN > 0 ? math.max(1, int(timeframe.in_seconds(ltf) / 60)) : math.max(1, int(chartSec / 60))
-if nUnits > 0
-    for i = 0 to nUnits - 1
-        int   t   = ibN > 0 ? ibT.get(i) : time
-        float uh  = ibN > 0 ? ibH.get(i) : high
-        float ul  = ibN > 0 ? ibL.get(i) : low
-        int   md  = hour(t, orTz) * 60 + minute(t, orTz)
-        int   rel = (md - orStartMin + 1440) % 1440
-        bool  inside = rel < orbLen
-        bool  before = not inside and rel > 1440 - uLen
-        if inside or before
-            int  wStart = inside ? t - rel * 60000 : t + (1440 - rel) * 60000
-            int  dk     = year(wStart, orTz) * 10000 + month(wStart, orTz) * 100 + dayofmonth(wStart, orTz)
-            bool sticks = before or rel + uLen > orbLen
-            if na(orDay) or dk != orDay
-                orDay      := dk
-                orH        := uh
-                orL        := ul
-                orEndTs    := wStart + orbLen * 60000
-                orBuilding := true
-                orDone     := false
-                orApprox   := sticks
-                newOr      := true
-            else if orBuilding
-                orH := math.max(orH, uh)
-                orL := math.min(orL, ul)
-                orApprox := orApprox or sticks
-
-if orBuilding and not na(orEndTs) and time_close >= orEndTs
-    orBuilding := false
-    orDone     := true
-    justDone   := true
-
-bool  orActive = showOR and not na(orEndTs) and time < orEndTs + holdHrs * 3600000
-float orRng    = orH - orL
-
-var line  lnH = na
-var line  lnL = na
-var line  lnM = na
-var box   bxZ = na
-var label tgH = na
-var label tgL = na
-var array<line>  extLn = array.new<line>()
-var array<label> extTg = array.new<label>()
-
-if showOR and newOr
-    extLn.clear()
-    extTg.clear()
-    lnH := line.new(bar_index, orH, bar_index, orH, color = cOrH, width = 2, style = line.style_dashed)
-    lnL := line.new(bar_index, orL, bar_index, orL, color = cOrL, width = 2, style = line.style_dashed)
-    lnM := line.new(bar_index, (orH + orL) / 2, bar_index, (orH + orL) / 2, color = color.new(#9E9E9E, 40), style = line.style_dotted)
-    bxZ := box.new(bar_index, orH, bar_index, orL, border_color = noCol, bgcolor = color.new(cOrH, 92))
-    tgH := label.new(bar_index, orH, "ORH", style = label.style_label_left, color = noCol, textcolor = cOrH, size = size.tiny)
-    tgL := label.new(bar_index, orL, "ORL", style = label.style_label_left, color = noCol, textcolor = cOrL, size = size.tiny)
-
-if showOR and not na(lnH) and orActive
-    float mid = (orH + orL) / 2
-    lnH.set_xy2(bar_index, orH)
-    lnH.set_y1(orH)
-    lnL.set_xy2(bar_index, orL)
-    lnL.set_y1(orL)
-    lnM.set_xy2(bar_index, mid)
-    lnM.set_y1(mid)
-    bxZ.set_top(orH)
-    bxZ.set_bottom(orL)
-    if orBuilding or justDone
-        bxZ.set_right(bar_index)
-    tgH.set_xy(bar_index, orH)
-    tgH.set_text("ORH " + str.tostring(orH, format.mintick) + (orApprox ? " ≈" : ""))
-    tgL.set_xy(bar_index, orL)
-    tgL.set_text("ORL " + str.tostring(orL, format.mintick) + (orApprox ? " ≈" : ""))
-    for ln in extLn
-        ln.set_x2(bar_index)
-    for tg in extTg
-        tg.set_x(bar_index)
-
-if showOR and justDone and not na(lnH)
-    lnH.set_style(line.style_solid)
-    lnL.set_style(line.style_solid)
-    if showExt and orRng > 0
-        for k = 1 to 2
-            float up = orH + k * orRng
-            float dn = orL - k * orRng
-            extLn.push(line.new(bar_index, up, bar_index, up, color = color.new(cOrH, 55), style = line.style_dotted))
-            extLn.push(line.new(bar_index, dn, bar_index, dn, color = color.new(cOrL, 55), style = line.style_dotted))
-            extTg.push(label.new(bar_index, up, "+" + str.tostring(k) + "R", style = label.style_label_left, color = noCol, textcolor = color.new(cOrH, 35), size = size.tiny))
-            extTg.push(label.new(bar_index, dn, "−" + str.tostring(k) + "R", style = label.style_label_left, color = noCol, textcolor = color.new(cOrL, 35), size = size.tiny))
-
-var bool brokeUp  = false
-var bool brokeDn  = false
-var bool failedUp = false
-var bool failedDn = false
-var int  brkUpBar = na
-var int  brkDnBar = na
-if newOr
-    brokeUp  := false
-    brokeDn  := false
-    failedUp := false
-    failedDn := false
-
-bool brkUp  = false
-bool brkDn  = false
-bool failUp = false
-bool failDn = false
-if barstate.isconfirmed and orDone and orActive
-    if brokeUp and not failedUp and bar_index > brkUpBar and bar_index - brkUpBar <= failBars and close < orH
-        failedUp := true
-        failUp   := true
-    if brokeDn and not failedDn and bar_index > brkDnBar and bar_index - brkDnBar <= failBars and close > orL
-        failedDn := true
-        failDn   := true
-    if not brokeUp and close > orH
-        brokeUp  := true
-        brkUp    := true
-        brkUpBar := bar_index
-    if not brokeDn and close < orL
-        brokeDn  := true
-        brkDn    := true
-        brkDnBar := bar_index
-
-bool aboveVw  = not na(vwapVal) and close > vwapVal
-bool belowVw  = not na(vwapVal) and close < vwapVal
-bool hotVol   = nz(relVol) >= alertRel
-bool strongUp = brkUp and hotVol and delta > 0 and aboveVw
-bool strongDn = brkDn and hotVol and delta < 0 and belowVw
-
-if showOR and showBrk and brkUp
-    label.new(bar_index, low, strongUp ? "▲★" : "▲", style = label.style_label_up, color = cBuy, textcolor = f_ink(cBuy), size = size.tiny,
-         tooltip = strongUp ? "OR breakout up + high volume + buy delta + above VWAP" : "Close above OR high")
-if showOR and showBrk and brkDn
-    label.new(bar_index, high, strongDn ? "▼★" : "▼", style = label.style_label_down, color = cSell, textcolor = f_ink(cSell), size = size.tiny,
-         tooltip = strongDn ? "OR breakdown + high volume + sell delta + below VWAP" : "Close below OR low")
-if showOR and showBrk and failUp
-    label.new(bar_index, high, "✕", style = label.style_label_down, color = cAbs, textcolor = f_ink(cAbs), size = size.tiny,
-         tooltip = "Breakout failed: back below OR high → possible trapped longs")
-if showOR and showBrk and failDn
-    label.new(bar_index, low, "✕", style = label.style_label_up, color = cAbs, textcolor = f_ink(cAbs), size = size.tiny,
-         tooltip = "Breakdown failed: back above OR low → possible trapped shorts")
-
-// ═════════════════════════════ DATA WINDOW ══════════════════════════════════
-plot(deltaPct, "Delta % (est.)", display = display.data_window)
-plot(relVol, "Relative volume", display = display.data_window)
-
-// ═════════════════════════════ DASHBOARD (compact) ══════════════════════════
-string dashPos = switch dashPosIn
-    "Top right"   => position.top_right
-    "Bottom left" => position.bottom_left
-    "Top left"    => position.top_left
-    => position.bottom_right
-color cText  = #D1D4DC
-color cMuted = #787B86
-var table dash = table.new(dashPos, 2, 6, bgcolor = color.new(#0B0E14, 20), frame_color = color.new(cVwap, 70), frame_width = 1)
-
-f_row(table tb, int r, string k, string v, color vc) =>
-    tb.cell(0, r, k, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
-    tb.cell(1, r, v, text_color = vc, text_size = size.tiny, text_halign = text.align_right)
-
-if showDash and barstate.islast
-    bool tickVol = syminfo.type != "futures" and syminfo.type != "crypto" and syminfo.type != "stock"
-    f_row(dash, 0, "Δ source", useIb ? "Intrabar " + f_tfLabel(ltf) : "Bar-shape est.", useIb ? cText : cAbs)
-    f_row(dash, 1, "Volume", f_fmt(nz(volume)) + (na(relVol) ? "" : "  ×" + str.tostring(relVol, "#.0")) + (tickVol ? " (ticks)" : ""), hotVol ? cAbs : cText)
-    f_row(dash, 2, "Δ% est.", str.tostring(deltaPct, "+#;-#") + "%", delta >= 0 ? cBuy : cSell)
-    float sig = vwapSd > 0 ? (close - vwapVal) / vwapSd : 0.0
-    f_row(dash, 3, "VWAP", not vwapOk ? "TF ≥ anchor" : na(vwapVal) ? "n/a" : str.tostring(sig, "+#.0;-#.0") + "σ", aboveVw ? cBuy : belowVw ? cSell : cText)
-    if showOR
-        string orState = na(orH) ? "—" : orBuilding ? "Building" : close > orH ? "Above" : close < orL ? "Below" : "Inside"
-        f_row(dash, 4, "Opening range", orState, orBuilding ? cAbs : close > nz(orH, close) ? cOrH : close < nz(orL, close) ? cOrL : cText)
-
-// ═════════════════════════════ ALERTS (closed bars) ═════════════════════════
-bool confHot = barstate.isconfirmed and hotVol
-alertcondition(confHot and not absBar and delta > 0, "High volume – buy", "{{ticker}}: high volume, buy-dominant (estimated)")
-alertcondition(confHot and not absBar and delta < 0, "High volume – sell", "{{ticker}}: high volume, sell-dominant (estimated)")
-alertcondition(confHot and absBar, "High volume – absorption", "{{ticker}}: high volume with a small body (absorption)")
-alertcondition(brkUp or brkDn, "Opening range breakout", "{{ticker}}: close outside the opening range")
-alertcondition(failUp or failDn, "Opening range failed breakout", "{{ticker}}: breakout failed, back inside the range")
+bool bubNow = barstate.isconfirmed and tier > 0
+alertcondition(bubNow and close >= open, "Volume bubble – up bar", "{{ticker}}: high-volume UP bar, volume {{volume}}")
+alertcondition(bubNow and close < open, "Volume bubble – down bar", "{{ticker}}: high-volume DOWN bar, volume {{volume}}")
+alertcondition(bubNow and tier == 3, "Volume bubble – large", "{{ticker}}: very high volume bar, volume {{volume}}")

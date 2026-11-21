@@ -1,19 +1,15 @@
 # Indicator-
 
-TradingView (Pine Script v6) indicators for XAUUSD order-flow style analysis.
+TradingView (Pine Script v6) indicators for XAUUSD.
 
-## `indicators/xau_volume_bubble_vwap_orb.pine` — Volume Orbs + VWAP (v2)
+## `indicators/xau_volume_bubble_vwap_orb.pine` — Volume Bubble + VWAP (v3)
 
 | Layer | What it does |
 |---|---|
-| **Volume Orbs** | Only the N highest-volume closed candles in the last window (default 5 in 100 bars, at least 5 bars apart). Each orb has a glowing dot above the candle, a volume pill below it (`3.2K VOL  Δ+42%`) and a level line at that candle's volume-weighted price. A solid line means the level has not been retested yet; a dotted line means it has. Orbs are green for buy, red for sell and yellow for absorption. Everything is redrawn on the last bar, so the chart stays clean. |
-| **VWAP** | Anchored (Session / Week / Month) with thin ±1σ / ±2σ lines. Band fill is optional. |
-| **Opening Range** | Optional and off by default: NY / COMEX / London / Asia / custom times, with 1R/2R targets and breakout / failed-breakout markers. |
-| **Dashboard** | Compact: delta source, volume ×average, Δ%, VWAP σ, and opening-range state when it is on. |
+| **Volume Bubble** | A bubble on every closed bar whose volume is ≥ 2× its 20-bar average (adjustable). The bubble sits **on that bar's own VWAP price** (volume-weighted price inside the bar, from 1m/5m intrabars; HLC3 if none). It comes in 3 sizes by volume multiple, with the **real volume number** printed inside. Colour = candle direction (green up / red down), with no buy/sell estimation. |
+| **VWAP** | Session / Week / Month VWAP line; optional ±1σ / ±2σ band lines. |
+| **Alerts** | Volume bubble – up bar / down bar / large. |
 
-### Install
-TradingView → Pine Editor → New indicator → paste the file → Save → Add to chart. On a 1m chart, delta uses the bar-shape estimate, because 1m intrabars on a 1m chart would always read ±100%.
+Install: TradingView → Pine Editor → New indicator → paste → Save → Add to chart.
 
-### Limitations
-- XAUUSD CFD volume is the broker's tick count, not traded size. Delta is an estimate, not aggressor data.
-- Defaults have not been backtested. The script has not been compiled here, so check it in the Pine Editor.
+Note: XAUUSD CFD volume is the broker's tick count, which is the only volume the feed provides. The script shows it as it is. Not compiled here, so check it in the Pine Editor.
