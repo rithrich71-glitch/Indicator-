@@ -7,7 +7,7 @@
 //    (≥ N × its recent average). The bubble sits ON THAT BAR'S VWAP PRICE
 //    (volume-weighted price inside the bar, from lower-timeframe data; HLC3
 //    when no intrabar data exists). Bubble size = how big the volume is.
-//    The real volume number is printed inside the bubble.
+//    The real volume number is shown in a solid pill above/below the candle.
 //  • Bubble colour = candle direction (green up, red down). No buy/sell
 //    estimation is used.
 //  • Session / Week / Month VWAP line with optional ±σ band lines.
@@ -26,7 +26,8 @@ bool   showBub  = input.bool(true, "Show bubbles", group = G_B)
 int    avgLen   = input.int(20, "Average volume length", minval = 5, group = G_B)
 float  minMult  = input.float(2.0, "Bubble when volume ≥ × average", minval = 1.0, step = 0.1, group = G_B,
      tooltip = "Small bubble from this multiple, medium from +1, large from +2. Raise it to see fewer bubbles.")
-bool   showTxt  = input.bool(true, "Volume number inside bubble", group = G_B)
+bool   showTxt  = input.bool(true, "Show volume text", group = G_B)
+string txtSzIn  = input.string("Normal", "Volume text size", options = ["Small", "Normal", "Large"], group = G_B)
 string ltfMode  = input.string("Auto", "Intrabar timeframe (bubble price)", options = ["Auto", "1", "5", "15", "60"], group = G_B,
      tooltip = "Used only to find each bar's own VWAP price. Auto: chart ≤15m → 1m, ≤4h → 5m, otherwise 60m. When it is not lower than the chart timeframe, HLC3 is used.")
 int    maxBars  = input.int(500, "Draw bubbles on the last N bars", minval = 50, maxval = 5000, group = G_B)
@@ -42,8 +43,7 @@ color  cDn   = input.color(#FF1744, "Down bar bubble", group = G_C)
 color  cVwap = input.color(#B388FF, "VWAP", group = G_C)
 
 // ═════════════════════════════ HELPERS ══════════════════════════════════════
-color noCol = color.new(color.black, 100)
-
+string txtSize = txtSzIn == "Small" ? size.small : txtSzIn == "Large" ? size.large : size.normal
 f_fmt(float v) =>
     float a = math.abs(v)
     a >= 1e9 ? str.tostring(v / 1e9, "#.#") + "B" : a >= 1e6 ? str.tostring(v / 1e6, "#.#") + "M" : a >= 1e3 ? str.tostring(v / 1e3, "#.#") + "K" : str.tostring(v, "#")
@@ -72,19 +72,28 @@ float mult   = avgVol > 0 ? nz(volume) / avgVol : 0.0
 int   tier   = mult >= minMult + 2 ? 3 : mult >= minMult + 1 ? 2 : mult >= minMult ? 1 : 0
 bool  recent = bar_index >= last_bar_index - maxBars
 
-if showBub and tier > 0 and barstate.isconfirmed and recent
-    color  c      = close >= open ? cUp : cDn
-    string bubSz  = tier == 3 ? size.huge : tier == 2 ? size.large : size.normal
-    string txtSz  = tier == 3 ? size.normal : tier == 2 ? size.small : size.tiny
-    string tip    = "Volume: " + str.tostring(volume, format.volume) + "  (×" + str.tostring(mult, "#.0") + " avg)" +
+float atr14 = ta.atr(14)
+bool  draw  = showBub and tier > 0 and barstate.isconfirmed and recent
+bool  upBar = close >= open
+float bubY  = draw ? barVwap : na
+
+// bubbles: real circles at the bar's VWAP price (3 sizes × 2 colours)
+plotshape(draw and upBar and tier == 1 ? bubY : na, "Bubble up S", shape.circle, location.absolute, color.new(cUp, 25), size = size.small)
+plotshape(draw and upBar and tier == 2 ? bubY : na, "Bubble up M", shape.circle, location.absolute, color.new(cUp, 20), size = size.normal)
+plotshape(draw and upBar and tier == 3 ? bubY : na, "Bubble up L", shape.circle, location.absolute, color.new(cUp, 15), size = size.large)
+plotshape(draw and not upBar and tier == 1 ? bubY : na, "Bubble down S", shape.circle, location.absolute, color.new(cDn, 25), size = size.small)
+plotshape(draw and not upBar and tier == 2 ? bubY : na, "Bubble down M", shape.circle, location.absolute, color.new(cDn, 20), size = size.normal)
+plotshape(draw and not upBar and tier == 3 ? bubY : na, "Bubble down L", shape.circle, location.absolute, color.new(cDn, 15), size = size.large)
+
+// volume text: a solid pill just outside the candle (above an up bar, below a down bar) so it never sits on the candle body
+if draw and showTxt
+    color  c   = upBar ? cUp : cDn
+    float  pad = atr14 * 0.25
+    string tip = "Volume: " + str.tostring(volume, format.volume) + "  (×" + str.tostring(mult, "#.0") + " avg)" +
          "\nBar VWAP: " + str.tostring(barVwap, format.mintick) + (vv > 0 ? "" : " (HLC3)")
-    // bubble
-    label.new(bar_index, barVwap, "●", style = label.style_label_center, color = noCol,
-         textcolor = color.new(c, tier == 3 ? 25 : tier == 2 ? 35 : 45), size = bubSz, tooltip = tip)
-    // real volume number in the centre
-    if showTxt
-        label.new(bar_index, barVwap, f_fmt(nz(volume)), style = label.style_label_center, color = noCol,
-             textcolor = color.white, size = txtSz, text_formatting = text.format_bold, tooltip = tip)
+    label.new(bar_index, upBar ? high + pad : low - pad, f_fmt(nz(volume)),
+         style = upBar ? label.style_label_down : label.style_label_up,
+         color = c, textcolor = #0B0E14, size = txtSize, text_formatting = text.format_bold, tooltip = tip)
 
 // ═════════════════════════════ VWAP ═════════════════════════════════════════
 bool chD = timeframe.change("D")
